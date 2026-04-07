@@ -9,10 +9,13 @@ from metaflow import (
     step,
 )
 
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 from common.pipeline import Pipeline, dataset
+
 
 environment_variables = {
     "KERAS_BACKEND": os.getenv("KERAS_BACKEND", "tensorflow"),
+    "MLFLOW_ENABLE_SYSTEM_METRICS_LOGGING": os.getenv("MLFLOW_ENABLE_SYSTEM_METRICS_LOGGING", "true"),
 }
 
 
@@ -244,7 +247,7 @@ class Training(Pipeline):
         # After training a model for this fold, we want to evaluate it.
         self.next(self.evaluate_fold)
 
-    @card
+    @card(type="html")
     @environment(vars=environment_variables)
     @step
     def evaluate_fold(self):
@@ -280,6 +283,28 @@ class Training(Pipeline):
             },
             run_id=self.mlflow_fold_run_id,
         )
+
+        from io import BytesIO
+        import base64
+        import matplotlib.pyplot as plt
+
+        cm = confusion_matrix(
+            self.y_test,
+            self.model.predict(self.x_test).argmax(axis=1),
+        )
+        disp = ConfusionMatrixDisplay(confusion_matrix=cm)
+        disp.plot()
+        buf = BytesIO()
+        plt.savefig(buf, format="png", bbox_inches="tight")
+        buf.seek(0)
+        img_base64 = base64.b64encode(buf.read()).decode("utf-8")
+        plt.close()
+
+        self.html = f"""
+        <h2>Fold results</h2>
+        <h3>Confusion Matrix</h3>
+        <img src="data:image/png;base64,{img_base64}" />
+        """
 
         # When we finish evaluating the models in the cross-validation process, we want
         # to average the scores to determine the overall model performance.
