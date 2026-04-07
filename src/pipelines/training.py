@@ -267,11 +267,33 @@ class Training(Pipeline):
             verbose=0,
         )
 
+        from keras.metrics import Precision, Recall
+        import numpy as np
+
+        predictions = self.model.predict(self.x_test)
+        y_true = self.y_test.ravel()
+        num_classes = predictions.shape[1]
+
+        precision_values = []
+        recall_values = []
+        for class_id in range(num_classes):
+            precision_metric = Precision(class_id=class_id)
+            recall_metric = Recall(class_id=class_id)
+            precision_metric.update_state(y_true, predictions)
+            recall_metric.update_state(y_true, predictions)
+            precision_values.append(float(precision_metric.result().numpy()))
+            recall_values.append(float(recall_metric.result().numpy()))
+
+        self.test_precision = float(np.mean(precision_values))
+        self.test_recall = float(np.mean(recall_values))
+
         self.logger.info(
-            "Fold %d - test_loss: %f - test_accuracy: %f",
+            "Fold %d - test_loss: %f - test_accuracy: %f - test_precision: %f - test_recall: %f",
             self.fold,
             self.test_loss,
             self.test_accuracy,
+            self.test_precision,
+            self.test_recall,
         )
 
         # Let's track the evaluation metrics under the nested MLflow run corresponding
@@ -280,6 +302,8 @@ class Training(Pipeline):
             {
                 "test_loss": self.test_loss,
                 "test_accuracy": self.test_accuracy,
+                "test_precision": self.test_precision,
+                "test_recall": self.test_recall,
             },
             run_id=self.mlflow_fold_run_id,
         )
@@ -324,15 +348,30 @@ class Training(Pipeline):
         # the `mlflow_run_id` artifact.
         self.merge_artifacts(inputs, include=["mlflow_run_id"])
 
-        # Let's calculate the mean and standard deviation of the accuracy and loss from
-        # all the cross-validation folds.
-        metrics = [[i.test_accuracy, i.test_loss] for i in inputs]
+        # Let's calculate the mean and standard deviation of the accuracy, loss,
+        # precision and recall from all the cross-validation folds.
+        metrics = [
+            [i.test_accuracy, i.test_loss, i.test_precision, i.test_recall]
+            for i in inputs
+        ]
 
-        self.test_accuracy, self.test_loss = np.mean(metrics, axis=0)
-        self.test_accuracy_std, self.test_loss_std = np.std(metrics, axis=0)
+        (
+            self.test_accuracy,
+            self.test_loss,
+            self.test_precision,
+            self.test_recall,
+        ) = np.mean(metrics, axis=0)
+        (
+            self.test_accuracy_std,
+            self.test_loss_std,
+            self.test_precision_std,
+            self.test_recall_std,
+        ) = np.std(metrics, axis=0)
 
         self.logger.info("Accuracy: %f ±%f", self.test_accuracy, self.test_accuracy_std)
         self.logger.info("Loss: %f ±%f", self.test_loss, self.test_loss_std)
+        self.logger.info("Precision: %f ±%f", self.test_precision, self.test_precision_std)
+        self.logger.info("Recall: %f ±%f", self.test_recall, self.test_recall_std)
 
         # Let's log the model metrics on the parent run.
         mlflow.log_metrics(
@@ -341,6 +380,10 @@ class Training(Pipeline):
                 "test_accuracy_std": self.test_accuracy_std,
                 "test_loss": self.test_loss,
                 "test_loss_std": self.test_loss_std,
+                "test_precision": self.test_precision,
+                "test_precision_std": self.test_precision_std,
+                "test_recall": self.test_recall,
+                "test_recall_std": self.test_recall_std,
             },
             run_id=self.mlflow_run_id,
         )
