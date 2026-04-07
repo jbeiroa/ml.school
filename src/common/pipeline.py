@@ -29,16 +29,16 @@ def dataset(step_name, flow, inputs=None, attr=None):  # noqa: ARG001
     current flow.
     """
     import numpy as np
-
-    # Let's check if the dataset file exists
-    if not Path(flow.dataset).exists():
-        # If we don't find the dataset file, we can set the artifact to None
+    # Assignent 1: load all files from folder instead of only one file.
+    # Let's check if the dataset folder exists
+    if not Path(flow.dataset_folder).exists():
+        # If we don't find the dataset folder, we can set the artifact to None
         # and let the step continue.
         flow.data = None
         yield
     else:
-        # If we find the dataset file, we can load it and process it.
-        data = pd.read_csv(flow.dataset)
+        # If we find the dataset folder, we can load all CSV files and concatenate them.
+        data = pd.concat([pd.read_csv(f) for f in Path(flow.dataset_folder).glob("*.csv")], ignore_index=True)
 
         # Replace extraneous values in the sex column with NaN
         data["sex"] = data["sex"].replace(".", np.nan)
@@ -194,10 +194,10 @@ class Pipeline(FlowSpec):
         default=project.backend["module"],
     )
 
-    dataset = Parameter(
+    dataset_folder = Parameter(
         "dataset",
-        help="Project dataset that will be used to train and evaluate the model.",
-        default="data/penguins.csv",
+        help="Project dataset folder that will be used to train and evaluate the model.",
+        default="data/",
     )
 
     mlflow_tracking_uri = Parameter(

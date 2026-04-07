@@ -36,7 +36,7 @@ def commentator_after_agent_callback(
 
 
 commentator_agent = LlmAgent(
-    model=LiteLlm(model="openai/gpt-5-mini"),
+    model=LiteLlm(model="gemini/gemini-2.5-flash"),
     name="commentator",
     description="Game commentator",
     instruction=COMMENTATOR_INSTRUCTIONS,

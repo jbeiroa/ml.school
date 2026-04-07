@@ -102,4 +102,4 @@ def create_player_agent(player_id: int, model_name: str) -> LlmAgent:
 
 
 player1_agent = create_player_agent(1, "gemini/gemini-2.5-flash")
-player2_agent = create_player_agent(2, "openai/gpt-5-mini")
+player2_agent = create_player_agent(2, "gemini/gemini-2.5-flash")
