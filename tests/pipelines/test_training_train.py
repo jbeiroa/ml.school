@@ -1,3 +1,4 @@
+import pytest
 from keras import optimizers
 
 from pipelines.training import build_model
@@ -44,6 +45,17 @@ def test_train_fold_builds_model(training_run):
 def test_train_fold_creates_mlflow_nested_run(training_run):
     data = training_run["train_fold"].task.data
     assert data.mlflow_fold_run_id is not None
+
+
+def test_train_fold_logs_best_epoch_for_keras(training_run):
+    # This test only runs for Keras models
+    if training_run["train_fold"].task.data.model_type != "keras":
+        pytest.skip("Test only applies to Keras models")
+
+    data = training_run["train_fold"].task.data
+    # Check that best_epoch is set (should be less than or equal to training_epochs)
+    assert hasattr(data, 'best_epoch')
+    assert data.best_epoch <= data.training_epochs
 
 
 def test_train_stores_model_as_artifact(training_run):

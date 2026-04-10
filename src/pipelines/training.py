@@ -10,6 +10,9 @@ from metaflow import (
 )
 
 from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from xgboost import XGBClassifier
 from common.pipeline import Pipeline, dataset
 
 
@@ -17,7 +20,6 @@ environment_variables = {
     "KERAS_BACKEND": os.getenv("KERAS_BACKEND", "tensorflow"),
     "MLFLOW_ENABLE_SYSTEM_METRICS_LOGGING": os.getenv("MLFLOW_ENABLE_SYSTEM_METRICS_LOGGING", "true"),
 }
-
 
 def build_features_transformer():
     """Build a Scikit-Learn transformer to preprocess the feature columns."""
@@ -91,6 +93,12 @@ def build_model(input_shape, learning_rate=0.01):
 
     return model
 
+model_registry = {
+    "logistic_regression": LogisticRegression,
+    "random_forest": RandomForestClassifier,
+    "xgboost": XGBClassifier,
+    "keras": build_model
+}
 
 class Training(Pipeline):
     """Training pipeline.
@@ -115,6 +123,24 @@ class Training(Pipeline):
         "accuracy-threshold",
         help="Minimum accuracy threshold required to register the model.",
         default=0.7,
+    )
+
+    model_type = Parameter(
+        "model-type",
+        help="Type of model to train from model registry.",
+        default="keras"
+    )
+
+    validation_split = Parameter(
+        "validation-split",
+        help="Fraction of training data to use for validation during Keras training.",
+        default=0.2,
+    )
+
+    early_stopping_patience = Parameter(
+        "early-stopping-patience",
+        help="Number of epochs with no improvement after which training will be stopped for Keras models.",
+        default=5,
     )
 
     @dataset
@@ -225,24 +251,60 @@ class Training(Pipeline):
             # We are currently training a model corresponding to an individual fold,
             # so we don't want to log that model because it's useless.
             mlflow.autolog(log_models=False)
+            # log model_type
+            mlflow.log_params(
+                {"model_type": self.model_type},
+            )
 
             # Let's now build and fit the model on the training data we processed in the
             # previous step.
-            self.model = build_model(self.x_train.shape[1])
-            history = self.model.fit(
-                self.x_train,
-                self.y_train,
-                epochs=self.training_epochs,
-                batch_size=self.training_batch_size,
-                verbose=0,
-            )
+            if self.model_type == "keras":
+                from keras.callbacks import EarlyStopping
 
-        self.logger.info(
-            "Fold %d - train_loss: %f - train_accuracy: %f",
-            self.fold,
-            history.history["loss"][-1],
-            history.history["accuracy"][-1],
-        )
+                self.model = build_model(self.x_train.shape[1])
+                early_stopping = EarlyStopping(
+                    monitor='val_loss',
+                    min_delta=0.01,
+                    patience=self.early_stopping_patience,
+                    restore_best_weights=True,
+                    mode='auto'
+                )
+                history = self.model.fit(
+                    self.x_train,
+                    self.y_train,
+                    epochs=self.training_epochs,
+                    batch_size=self.training_batch_size,
+                    validation_split=self.validation_split,
+                    callbacks=[early_stopping],
+                    verbose=0,
+                )
+
+                # Log the optimal epoch and validation metrics
+                self.best_epoch = len(history.history['loss'])  # epochs actually trained
+                mlflow.log_metrics({
+                    "best_epoch": self.best_epoch,
+                    "val_loss": history.history['val_loss'][-1],
+                    "val_accuracy": history.history['val_accuracy'][-1],
+                }, run_id=self.mlflow_fold_run_id)
+
+                # Log per-epoch validation metrics
+                for epoch in range(len(history.history['val_loss'])):
+                    mlflow.log_metrics({
+                        "val_loss": history.history['val_loss'][epoch],
+                        "val_accuracy": history.history['val_accuracy'][epoch],
+                    }, step=epoch, run_id=self.mlflow_fold_run_id)
+
+                self.logger.info(
+                    "Fold %d - train_loss: %f - train_accuracy: %f",
+                    self.fold,
+                    history.history["loss"][-1],
+                    history.history["accuracy"][-1],
+                )
+            else:
+                ModelClass = model_registry[self.model_type]
+                self.model = ModelClass()
+                self.model.fit(self.x_train, self.y_train.ravel())
+
 
         # After training a model for this fold, we want to evaluate it.
         self.next(self.evaluate_fold)
@@ -260,61 +322,84 @@ class Training(Pipeline):
 
         self.logger.info("Evaluating fold %d...", self.fold)
 
-        # Let's evaluate the model using the test data we processed before.
-        self.test_loss, self.test_accuracy = self.model.evaluate(
-            self.x_test,
-            self.y_test,
-            verbose=0,
-        )
-
-        from keras.metrics import Precision, Recall
-        import numpy as np
-
-        predictions = self.model.predict(self.x_test)
         y_true = self.y_test.ravel()
-        num_classes = predictions.shape[1]
 
-        precision_values = []
-        recall_values = []
-        for class_id in range(num_classes):
-            precision_metric = Precision(class_id=class_id)
-            recall_metric = Recall(class_id=class_id)
-            precision_metric.update_state(y_true, predictions)
-            recall_metric.update_state(y_true, predictions)
-            precision_values.append(float(precision_metric.result().numpy()))
-            recall_values.append(float(recall_metric.result().numpy()))
+        if self.model_type == "keras":
+            # Let's evaluate the model using the test data we processed before.
+            self.test_loss, self.test_accuracy = self.model.evaluate(
+                self.x_test,
+                y_true,
+                verbose=0,
+            )
 
-        self.test_precision = float(np.mean(precision_values))
-        self.test_recall = float(np.mean(recall_values))
+            from keras.metrics import Precision, Recall
+            import numpy as np
 
-        self.logger.info(
-            "Fold %d - test_loss: %f - test_accuracy: %f - test_precision: %f - test_recall: %f",
-            self.fold,
-            self.test_loss,
-            self.test_accuracy,
-            self.test_precision,
-            self.test_recall,
-        )
+            predictions = self.model.predict(self.x_test)
+            num_classes = predictions.shape[1]
+
+            precision_values = []
+            recall_values = []
+            for class_id in range(num_classes):
+                precision_metric = Precision(class_id=class_id)
+                recall_metric = Recall(class_id=class_id)
+                precision_metric.update_state(y_true, predictions)
+                recall_metric.update_state(y_true, predictions)
+                precision_values.append(float(precision_metric.result().numpy()))
+                recall_values.append(float(recall_metric.result().numpy()))
+
+            self.test_precision = float(np.mean(precision_values))
+            self.test_recall = float(np.mean(recall_values))
+        else:
+            from sklearn.metrics import accuracy_score, precision_score, recall_score
+
+            predictions = self.model.predict(self.x_test)
+            self.test_accuracy = accuracy_score(y_true, predictions)
+            self.test_precision = precision_score(y_true, predictions, average='macro')
+            self.test_recall = recall_score(y_true, predictions, average='macro')
+            self.test_loss = 0  # Placeholder, since sklearn doesn't have loss
+
+        if self.model_type == "keras":
+            self.logger.info(
+                "Fold %d - test_loss: %f - test_accuracy: %f - test_precision: %f - test_recall: %f",
+                self.fold,
+                self.test_loss,
+                self.test_accuracy,
+                self.test_precision,
+                self.test_recall,
+            )
+        else:
+            self.logger.info(
+                "Fold %d - test_accuracy: %f - test_precision: %f - test_recall: %f",
+                self.fold,
+                self.test_accuracy,
+                self.test_precision,
+                self.test_recall,
+            )
 
         # Let's track the evaluation metrics under the nested MLflow run corresponding
         # to the current fold.
-        mlflow.log_metrics(
-            {
-                "test_loss": self.test_loss,
-                "test_accuracy": self.test_accuracy,
-                "test_precision": self.test_precision,
-                "test_recall": self.test_recall,
-            },
-            run_id=self.mlflow_fold_run_id,
-        )
+        metrics = {
+            "test_accuracy": self.test_accuracy,
+            "test_precision": self.test_precision,
+            "test_recall": self.test_recall,
+        }
+        if self.model_type == "keras":
+            metrics["test_loss"] = self.test_loss
+        mlflow.log_metrics(metrics, run_id=self.mlflow_fold_run_id)
 
         from io import BytesIO
         import base64
         import matplotlib.pyplot as plt
 
+        if self.model_type == "keras":
+            predicted_classes = self.model.predict(self.x_test).argmax(axis=1)
+        else:
+            predicted_classes = self.model.predict(self.x_test)
+
         cm = confusion_matrix(
-            self.y_test,
-            self.model.predict(self.x_test).argmax(axis=1),
+            y_true,
+            predicted_classes,
         )
         disp = ConfusionMatrixDisplay(confusion_matrix=cm)
         disp.plot()
@@ -350,43 +435,45 @@ class Training(Pipeline):
 
         # Let's calculate the mean and standard deviation of the accuracy, loss,
         # precision and recall from all the cross-validation folds.
-        metrics = [
-            [i.test_accuracy, i.test_loss, i.test_precision, i.test_recall]
-            for i in inputs
-        ]
+        accuracies = [i.test_accuracy for i in inputs]
+        precisions = [i.test_precision for i in inputs]
+        recalls = [i.test_recall for i in inputs]
 
-        (
-            self.test_accuracy,
-            self.test_loss,
-            self.test_precision,
-            self.test_recall,
-        ) = np.mean(metrics, axis=0)
-        (
-            self.test_accuracy_std,
-            self.test_loss_std,
-            self.test_precision_std,
-            self.test_recall_std,
-        ) = np.std(metrics, axis=0)
+        self.test_accuracy = np.mean(accuracies)
+        self.test_precision = np.mean(precisions)
+        self.test_recall = np.mean(recalls)
+        self.test_accuracy_std = np.std(accuracies)
+        self.test_precision_std = np.std(precisions)
+        self.test_recall_std = np.std(recalls)
+
+        if self.model_type == "keras":
+            losses = [i.test_loss for i in inputs]
+            self.test_loss = np.mean(losses)
+            self.test_loss_std = np.std(losses)
+            self.logger.info("Loss: %f ±%f", self.test_loss, self.test_loss_std)
+        else:
+            self.test_loss = 0
+            self.test_loss_std = 0
 
         self.logger.info("Accuracy: %f ±%f", self.test_accuracy, self.test_accuracy_std)
-        self.logger.info("Loss: %f ±%f", self.test_loss, self.test_loss_std)
         self.logger.info("Precision: %f ±%f", self.test_precision, self.test_precision_std)
         self.logger.info("Recall: %f ±%f", self.test_recall, self.test_recall_std)
 
         # Let's log the model metrics on the parent run.
-        mlflow.log_metrics(
-            {
-                "test_accuracy": self.test_accuracy,
-                "test_accuracy_std": self.test_accuracy_std,
+        metrics = {
+            "test_accuracy": self.test_accuracy,
+            "test_accuracy_std": self.test_accuracy_std,
+            "test_precision": self.test_precision,
+            "test_precision_std": self.test_precision_std,
+            "test_recall": self.test_recall,
+            "test_recall_std": self.test_recall_std,
+        }
+        if self.model_type == "keras":
+            metrics.update({
                 "test_loss": self.test_loss,
                 "test_loss_std": self.test_loss_std,
-                "test_precision": self.test_precision,
-                "test_precision_std": self.test_precision_std,
-                "test_recall": self.test_recall,
-                "test_recall_std": self.test_recall_std,
-            },
-            run_id=self.mlflow_run_id,
-        )
+            })
+        mlflow.log_metrics(metrics, run_id=self.mlflow_run_id)
 
         # After we finish evaluating the cross-validation process, we can send the flow
         # to the registration step to register the final version of the model.
@@ -422,6 +509,10 @@ class Training(Pipeline):
         import mlflow
 
         self.logger.info("Training final model...")
+        mlflow.log_params(
+            {"model_type": self.model_type},
+            run_id=self.mlflow_run_id,
+        )
 
         # Let's log the training process under the current MLflow run.
         with mlflow.start_run(run_id=self.mlflow_run_id):
@@ -429,16 +520,99 @@ class Training(Pipeline):
             mlflow.autolog(log_models=False)
 
             # Let's now build and fit the model on the entire dataset.
-            self.model = build_model(self.x.shape[1])
-            self.model.fit(
-                self.x,
-                self.y,
-                epochs=self.training_epochs,
-                batch_size=self.training_batch_size,
-                verbose=2,
+            if self.model_type == "keras":
+                from keras.callbacks import EarlyStopping
+
+                self.model = build_model(self.x.shape[1])
+                early_stopping = EarlyStopping(
+                    monitor='val_loss',
+                    min_delta=0.01,
+                    patience=self.early_stopping_patience,
+                    restore_best_weights=True,
+                    mode='auto'
+                )
+                history = self.model.fit(
+                    self.x,
+                    self.y.ravel(),
+                    epochs=self.training_epochs,
+                    batch_size=self.training_batch_size,
+                    validation_split=self.validation_split,
+                    callbacks=[early_stopping],
+                    verbose=2,
+                )
+
+                # Log the optimal epoch and final validation metrics
+                self.best_epoch = len(history.history['loss'])
+                mlflow.log_metrics({
+                    "best_epoch": self.best_epoch,
+                    "final_val_loss": history.history['val_loss'][-1],
+                    "final_val_accuracy": history.history['val_accuracy'][-1],
+                }, run_id=self.mlflow_run_id)
+
+                # Log per-epoch validation metrics for the final model
+                for epoch in range(len(history.history['val_loss'])):
+                    mlflow.log_metrics({
+                        "val_loss": history.history['val_loss'][epoch],
+                        "val_accuracy": history.history['val_accuracy'][epoch],
+                    }, step=epoch, run_id=self.mlflow_run_id)
+            else:
+                ModelClass = model_registry[self.model_type]
+                self.model = ModelClass()
+                self.model.fit(self.x, self.y.ravel())
+
+        # After we finish training the model, we want to create the feature importance card.
+        self.next(self.feature_importance_card)
+
+    @card(type="html")
+    @step
+    def feature_importance_card(self):
+        """Create a feature importance visualization card."""
+        # Compute feature importance
+        feature_importance_pairs = self._compute_feature_importance()
+
+        # Create HTML visualization
+        html_parts = [
+            "<h2>Feature Importance</h2>",
+            "<p>This chart shows the relative importance of each feature in predicting penguin species.</p>",
+            "<div style='margin: 20px 0;'>",
+            "<table style='border-collapse: collapse; width: 100%;'>",
+            "<thead>",
+            "<tr style='background-color: #f2f2f2;'>",
+            "<th style='border: 1px solid #ddd; padding: 8px; text-align: left;'>Feature</th>",
+            "<th style='border: 1px solid #ddd; padding: 8px; text-align: left;'>Importance</th>",
+            "<th style='border: 1px solid #ddd; padding: 8px; text-align: left;'>Bar</th>",
+            "</tr>",
+            "</thead>",
+            "<tbody>"
+        ]
+
+        # Find max importance for scaling
+        max_importance = max(imp for _, imp in feature_importance_pairs) if feature_importance_pairs else 1
+
+        for feature_name, importance in feature_importance_pairs:
+            # Create a simple bar using CSS
+            bar_width = int((importance / max_importance) * 200) if max_importance > 0 else 0
+            bar_html = f"<div style='width: {bar_width}px; height: 20px; background-color: #4CAF50; border-radius: 3px;'></div>"
+
+            html_parts.append(
+                f"<tr>"
+                f"<td style='border: 1px solid #ddd; padding: 8px;'>{feature_name}</td>"
+                f"<td style='border: 1px solid #ddd; padding: 8px;'>{importance:.4f}</td>"
+                f"<td style='border: 1px solid #ddd; padding: 8px;'>{bar_html}</td>"
+                f"</tr>"
             )
 
-        # After we finish training the model, we want to register it.
+        html_parts.extend([
+            "</tbody>",
+            "</table>",
+            "</div>",
+            f"<p><strong>Model Type:</strong> {self.model_type}</p>",
+            f"<p><strong>Number of Features:</strong> {len(feature_importance_pairs)}</p>"
+        ])
+
+        self.html = "\n".join(html_parts)
+
+        # After creating the card, proceed to model registration
         self.next(self.register)
 
     @environment(vars=environment_variables)
@@ -513,8 +687,12 @@ class Training(Pipeline):
         import joblib
 
         # Let's start by saving the model inside the supplied directory.
-        model_path = (Path(directory) / "model.keras").as_posix()
-        self.model.save(model_path)
+        if self.model_type == "keras":
+            model_path = (Path(directory) / "model.keras").as_posix()
+            self.model.save(model_path)
+        else:
+            model_path = (Path(directory) / "model.joblib").as_posix()
+            joblib.dump(self.model, model_path)
 
         # We also want to save the Scikit-Learn transformers so we can package them
         # with the model and use them during inference.
@@ -531,19 +709,80 @@ class Training(Pipeline):
 
     def _get_model_pip_requirements(self):
         """Return the list of required packages to run the model in production."""
-        import keras
         import numpy as np
         import pandas as pd
         import sklearn
-        import tensorflow as tf
 
-        return [
+        requirements = [
             f"scikit-learn=={sklearn.__version__}",
             f"pandas=={pd.__version__}",
             f"numpy=={np.__version__}",
-            f"keras=={keras.__version__}",
-            f"tensorflow=={tf.__version__}",
+            "joblib",
         ]
+
+        if self.model_type == "keras":
+            import keras
+            import tensorflow as tf
+            requirements.extend([
+                f"keras=={keras.__version__}",
+                f"tensorflow=={tf.__version__}",
+            ])
+        elif self.model_type == "xgboost":
+            import xgboost
+            requirements.append(f"xgboost=={xgboost.__version__}")
+
+        return requirements
+
+
+    def _compute_feature_importance(self):
+        """Compute feature importance for the trained model.
+
+        Returns a list of tuples (feature_name, importance) sorted by importance descending.
+        """
+        import numpy as np
+        from sklearn.inspection import permutation_importance
+
+        if self.model_type == "keras":
+            # For Keras models, use permutation importance on the training data
+            # We'll use a subset of the data for efficiency
+            n_samples = min(1000, len(self.x))  # Use up to 1000 samples
+            indices = np.random.choice(len(self.x), n_samples, replace=False)
+            x_sample = self.x[indices]
+            y_sample = self.y[indices].ravel()
+
+            # Get predictions
+            predictions = self.model.predict(x_sample)
+            if predictions.shape[1] > 1:  # Multi-class
+                predictions = np.argmax(predictions, axis=1)
+            else:  # Binary
+                predictions = (predictions > 0.5).astype(int).ravel()
+
+            # Compute permutation importance
+            perm_importance = permutation_importance(
+                self.model, x_sample, y_sample,
+                n_repeats=5, random_state=42, scoring='accuracy'
+            )
+            importances = perm_importance.importances_mean
+
+        elif self.model_type in ["random_forest", "xgboost"]:
+            # Tree-based models have built-in feature importance
+            importances = self.model.feature_importances_
+
+        elif self.model_type == "logistic_regression":
+            # Linear models have coefficients
+            importances = np.abs(self.model.coef_[0])  # Take absolute values
+
+        else:
+            raise ValueError(f"Feature importance not supported for model type: {self.model_type}")
+
+        # Get feature names from the transformer
+        feature_names = self.features_transformer.get_feature_names_out()
+
+        # Create list of (name, importance) tuples and sort by importance descending
+        feature_importance_pairs = list(zip(feature_names, importances))
+        feature_importance_pairs.sort(key=lambda x: x[1], reverse=True)
+
+        return feature_importance_pairs
 
 
 if __name__ == "__main__":

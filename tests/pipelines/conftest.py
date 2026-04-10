@@ -11,8 +11,8 @@ def mlflow_directory():
     return (Path(temporal_directory) / "mlflow").as_posix()
 
 
-@pytest.fixture(scope="session")
-def training_run(mlflow_directory):
+@pytest.fixture(scope="session", params=["keras", "logistic_regression"])
+def training_run(mlflow_directory, request):
     with Runner(
         "src/pipelines/training.py",
         show_output=False,
@@ -20,6 +20,7 @@ def training_run(mlflow_directory):
         mlflow_tracking_uri=mlflow_directory,
         training_epochs=1,
         accuracy_threshold=0.1,
+        model_type=request.param,
     ) as running:
         return running.run
 

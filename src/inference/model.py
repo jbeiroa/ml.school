@@ -2,6 +2,7 @@ import importlib
 import json
 import logging
 import os
+import time
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
@@ -41,6 +42,16 @@ class Output(pydantic.BaseModel):
     prediction: str | None = None
     confidence: float | None = None
 
+class PredictionMetrics(pydantic.BaseModel):
+    """Prediction metrics that will be logged for each prediction."""
+
+    latency_input_ms: float
+    latency_inference_ms: float
+    latency_output_ms: float
+    latency_total_ms: float
+    sample_count: int
+    error: str | None = None
+    error_phase: str | None = None
 
 class Model(mlflow.pyfunc.PythonModel):
     """A custom model implementing an inference pipeline to classify penguins.
@@ -82,6 +93,8 @@ class Model(mlflow.pyfunc.PythonModel):
         client, making a prediction using the model, and returning a readable response
         to the client.
         """
+        # set timer for prediction metrics
+        start_time = time.perf_counter()
         # Let's convert the input data into a DataFrame so we can process it
         # using the Scikit-Learn transformers.
         model_input = pd.DataFrame([sample.model_dump() for sample in model_input])
@@ -89,6 +102,17 @@ class Model(mlflow.pyfunc.PythonModel):
         if model_input.empty:
             self.logger.warning("Received an empty request.")
             return []
+
+        # initialize metrics
+        metrics = {
+            "latency_input_ms": 0.0,
+            "latency_inference_ms": 0.0,
+            "latency_output_ms": 0.0,
+            "latency_total_ms": 0.0,
+            "sample_count": len(model_input),
+            "error": None,
+            "error_phase": None,
+        }
 
         self.logger.info(
             "Received prediction request with %d %s",
@@ -98,12 +122,46 @@ class Model(mlflow.pyfunc.PythonModel):
 
         model_output = []
 
+        # Input processing phase
+        input_start = time.perf_counter()
         transformed_payload = self.process_input(model_input)
-        if transformed_payload is not None:
-            self.logger.info("Making a prediction using the transformed payload...")
-            predictions = self.model.predict(transformed_payload, verbose=0)
+        metrics["latency_input_ms"] = (time.perf_counter() - input_start) * 1000
 
+        if transformed_payload is None:
+            self.logger.warning("The request payload could not be processed.")
+            metrics["error"] = "The request payload could not be processed."
+            metrics["error_phase"] = "input_processing"
+            return []
+
+        # Inference phase
+        inference_start = time.perf_counter()
+
+        try:
+            self.logger.info("Making a prediction using the transformed payload...")
+            if self.is_keras:
+                predictions = self.model.predict(transformed_payload, verbose=0)
+            else:
+                predictions = self.model.predict(transformed_payload)
+            metrtics["latency_inference_ms"] = (time.perf_counter() - inference_start) * 1000
+        except Exception:
+            self.logger.exception("There was an error during inference.")
+            metrics["error"] = "There was an error during inference."
+            metrics["error_phase"] = "inference"
+            return []
+
+        # Output processing phase
+        output_start = time.perf_counter()
+        try:
             model_output = self.process_output(predictions)
+        except Exception:
+            self.logger.exception("There was an error processing the output.")
+            metrics["error"] = "There was an error processing the output."
+            metrics["error_phase"] = "output_processing"
+            return []
+
+        # Total latency
+        metrics["latency_output_ms"] = (time.perf_counter() - output_start) * 1000
+        self._log_metrics(metrics)
 
         if self.backend is not None:
             self.backend.save(model_input, model_output)
@@ -142,8 +200,12 @@ class Model(mlflow.pyfunc.PythonModel):
 
         result = []
         if output is not None:
-            prediction = np.argmax(output, axis=1)
-            confidence = np.max(output, axis=1)
+            if self.is_keras:
+                prediction = np.argmax(output, axis=1)
+                confidence = np.max(output, axis=1)
+            else:
+                prediction = output  # already classes
+                confidence = np.full(len(output), None)  # no confidence for sklearn
 
             # Let's transform the prediction index back to the
             # original species. We can use the target transformer
@@ -157,7 +219,7 @@ class Model(mlflow.pyfunc.PythonModel):
             # Notice that we need to unwrap the numpy values so we can serialize the
             # output as JSON.
             result = [
-                {"prediction": p.item(), "confidence": c.item()}
+                {"prediction": p.item(), "confidence": c.item() if c is not None else None}
                 for p, c in zip(prediction, confidence, strict=True)
             ]
 
@@ -225,8 +287,14 @@ class Model(mlflow.pyfunc.PythonModel):
         )
         self.target_transformer = joblib.load(context.artifacts["target_transformer"])
 
-        # Then, we can load the Keras model we trained.
-        self.model = keras.saving.load_model(context.artifacts["model"])
+        # Then, we can load the model based on the file type.
+        model_path = context.artifacts["model"]
+        if model_path.endswith(".keras"):
+            self.model = keras.saving.load_model(model_path)
+            self.is_keras = True
+        else:
+            self.model = joblib.load(model_path)
+            self.is_keras = False
 
     def _configure_logging(self):
         """Configure how the logging system will behave."""
@@ -239,6 +307,20 @@ class Model(mlflow.pyfunc.PythonModel):
         )
 
         self.logger = logging.getLogger("model")
+
+    def _log_metrics(self, metrics: dict[str, Any]) -> None:
+        """Log the prediction metrics to MLflow."""
+        if metrics["error"] is None:
+            mlflow.log_metrics({
+                "latency_input_ms": metrics["latency_input_ms"],
+                "latency_inference_ms": metrics["latency_inference_ms"],
+                "latency_output_ms": metrics["latency_output_ms"],
+                "latency_total_ms": metrics["latency_total_ms"],
+            })
+        else:
+            mlflow.log_metrics({
+                "error": metrics["error"],
+                "error_phase": metrics["error_phase"]})
 
 
 set_model(Model())

@@ -47,12 +47,14 @@ def test_predict(model):
 
 def test_predict_backend_is_called(model):
     model.backend = Mock()
+    model.model.predict = Mock(return_value=np.array([0]))
     model.predict(None, [{"island": "Torgersen"}])
     model.backend.save.assert_called_once()
 
 
 def test_predict_backend_receives_model_input(model):
     model.backend = Mock()
+    model.model.predict = Mock(return_value=np.array([0, 0]))
     model_input = [{"island": "Torgersen"}, {"island": "Biscoe"}]
     model.predict(context=None, model_input=model_input)
 
@@ -63,12 +65,13 @@ def test_predict_backend_receives_model_input(model):
 
 def test_predict_backend_receives_prediction(model):
     model.backend = Mock()
+    model.model.predict = Mock(return_value=np.array([0]))
     model_input = [{"island": "Torgersen"}]
     model.predict(context=None, model_input=model_input)
 
     backend_output_arg = model.backend.save.call_args[0][1]
     assert backend_output_arg == [
-        {"prediction": "Adelie", "confidence": 0.6},
+        {"prediction": "Adelie", "confidence": None},
     ]
 
 
@@ -105,12 +108,14 @@ def test_process_input_returns_none_on_exception(model):
 
 
 def test_process_output_returns_json(model):
+    model.is_keras = True
     output = np.array([[0.6, 0.3, 0.1]])
     result = model.process_output(output)
     assert isinstance(result[0], dict)
 
 
 def test_process_output_returns_prediction_and_confidence(model):
+    model.is_keras = True
     output = np.array([[0.6, 0.3, 0.1]])
     result = model.process_output(output)
 
@@ -118,6 +123,7 @@ def test_process_output_returns_prediction_and_confidence(model):
 
 
 def test_process_output_returns_species(model):
+    model.is_keras = True
     output = np.array([[0.7, 0.2, 0.1], [0.2, 0.7, 0.1], [0.1, 0.2, 0.7]])
     result = model.process_output(output)
 
