@@ -748,19 +748,40 @@ class Training(Pipeline):
             n_samples = min(1000, len(self.x))  # Use up to 1000 samples
             indices = np.random.choice(len(self.x), n_samples, replace=False)
             x_sample = self.x[indices]
-            y_sample = self.y[indices].ravel()
+            # Permutation importance expects integer class labels for classification
+            y_sample = self.y[indices].ravel().astype(int)
 
-            # Get predictions
-            predictions = self.model.predict(x_sample)
-            if predictions.shape[1] > 1:  # Multi-class
-                predictions = np.argmax(predictions, axis=1)
-            else:  # Binary
-                predictions = (predictions > 0.5).astype(int).ravel()
+            # We need to wrap the Keras model so its `predict` method returns class
+            # labels (indices) instead of probabilities. This is required for
+            # `permutation_importance` with `scoring='accuracy'`.
+            class KerasClassifierWrapper:
+                def __init__(self, model, classes):
+                    self.model = model
+                    self._estimator_type = "classifier"
+                    self.classes_ = classes
 
-            # Compute permutation importance
+                def fit(self, X, y=None):
+                    # Dummy fit method to pass scikit-learn validation
+                    return self
+
+                def get_params(self, deep=True):
+                    # Dummy get_params method to pass scikit-learn validation
+                    return {}
+
+                def predict(self, X):
+                    predictions = self.model.predict(X, verbose=0)
+                    if predictions.shape[1] > 1:  # Multi-class
+                        return np.argmax(predictions, axis=1)
+                    return (predictions > 0.5).astype(int).ravel()
+
+            # Compute permutation importance using the wrapped model
             perm_importance = permutation_importance(
-                self.model, x_sample, y_sample,
-                n_repeats=5, random_state=42, scoring='accuracy'
+                KerasClassifierWrapper(self.model, np.unique(y_sample)),
+                x_sample,
+                y_sample,
+                n_repeats=5,
+                random_state=42,
+                scoring="accuracy",
             )
             importances = perm_importance.importances_mean
 

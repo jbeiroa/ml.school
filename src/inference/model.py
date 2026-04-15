@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import time
+import hashlib
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
@@ -142,7 +143,7 @@ class Model(mlflow.pyfunc.PythonModel):
                 predictions = self.model.predict(transformed_payload, verbose=0)
             else:
                 predictions = self.model.predict(transformed_payload)
-            metrtics["latency_inference_ms"] = (time.perf_counter() - inference_start) * 1000
+            metrics["latency_inference_ms"] = (time.perf_counter() - inference_start) * 1000
         except Exception:
             self.logger.exception("There was an error during inference.")
             metrics["error"] = "There was an error during inference."
@@ -197,23 +198,32 @@ class Model(mlflow.pyfunc.PythonModel):
         model into a readable format that will be returned to the client.
         """
         self.logger.info("Processing prediction received from the model...")
+        # Debug: Log what we're actually receiving
+        self.logger.info(f"Output type: {type(output)}")
+        self.logger.info(f"Output shape: {output.shape if hasattr(output, 'shape') else 'N/A'}")
+        self.logger.info(f"Output dtype: {output.dtype if hasattr(output, 'dtype') else type(output[0]) if len(output) > 0 else 'empty'}")
+        self.logger.info(f"First prediction sample: {output[0] if hasattr(output, '__getitem__') else output}")
+        self.logger.info(f"is_keras flag: {self.is_keras}")
 
         result = []
         if output is not None:
             if self.is_keras:
                 prediction = np.argmax(output, axis=1)
                 confidence = np.max(output, axis=1)
+                # Let's transform the prediction index back to the
+                # original species. We can use the target transformer
+                # to access the list of classes.
+                classes = self.target_transformer.named_transformers_[
+                    "species"
+                ].categories_[0]
+                prediction = np.vectorize(lambda x: classes[x])(prediction)
             else:
-                prediction = output  # already classes
+                classes = self.target_transformer.named_transformers_[
+                    "species"
+                ].categories_[0]
+                # Cast the numerical float output to int so we can index the classes array
+                prediction = np.vectorize(lambda x: classes[int(x)])(output)
                 confidence = np.full(len(output), None)  # no confidence for sklearn
-
-            # Let's transform the prediction index back to the
-            # original species. We can use the target transformer
-            # to access the list of classes.
-            classes = self.target_transformer.named_transformers_[
-                "species"
-            ].categories_[0]
-            prediction = np.vectorize(lambda x: classes[x])(prediction)
 
             # We can now return the prediction and the confidence from the model.
             # Notice that we need to unwrap the numpy values so we can serialize the
