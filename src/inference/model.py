@@ -221,8 +221,11 @@ class Model(mlflow.pyfunc.PythonModel):
                 classes = self.target_transformer.named_transformers_[
                     "species"
                 ].categories_[0]
-                # Cast the numerical float output to int so we can index the classes array
-                prediction = np.vectorize(lambda x: classes[int(x)])(output)
+                # Cast the numerical float output to int so we can index the classes array.
+                # Notice that we are avoiding the use of `np.vectorize` to map the output
+                # to the class labels because it might truncate the strings if the first
+                # element is shorter than others.
+                prediction = np.array([classes[int(x)] for x in output])
                 confidence = np.full(len(output), None)  # no confidence for sklearn
 
             # We can now return the prediction and the confidence from the model.

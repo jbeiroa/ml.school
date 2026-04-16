@@ -35,41 +35,68 @@ class Monitoring(Pipeline):
         # Let's load the reference data. When running some of the tests and reports,
         # we need to have a prediction column in the reference data to match the
         # production dataset.
-        reference_data = self.data
+        reference_data = self.data.copy()
         reference_data["prediction"] = reference_data["species"]
         reference_data = reference_data.rename(
             columns={"species": "target"},
         )
 
+        # We want to be very careful with the data we pass to Evidently.
+        # NaNs in any column (even numerical ones) can cause validation errors
+        # in some versions of Evidently because it tries to compute unique value
+        # counts and uses the unique values (including NaN/float64) as labels.
+        cat_cols = ["island", "sex"]
+        num_cols = [
+            "culmen_length_mm",
+            "culmen_depth_mm",
+            "flipper_length_mm",
+            "body_mass_g",
+        ]
+        all_cols = cat_cols + num_cols + ["target", "prediction"]
+
+        # Only keep rows that have no NaNs in any of the columns we use.
+        # This is the most robust way to avoid Evidently crashing with float64
+        # label errors.
+        reference_data = reference_data.dropna(subset=all_cols)
+
+        # Ensure categorical columns are strings
+        for col in cat_cols + ["target", "prediction"]:
+            reference_data[col] = reference_data[col].astype(str)
+
         data_definition = DataDefinition(
+            categorical_columns=cat_cols,
+            numerical_columns=num_cols,
             classification=[
                 MulticlassClassification(
                     target="target",
                     prediction_labels="prediction",
                 )
-            ]
+            ],
         )
 
         self.reference_dataset = Dataset.from_pandas(
             reference_data, data_definition=data_definition
         )
 
-        # Let's now load the production data. We need to filter out the samples that
-        # don't have ground truth labels.
+        # Let's now load the production data.
         current_data = self.backend_impl.load(self.limit)
-        current_data = (
-            current_data[current_data["target"].notna()]
-            if current_data is not None and not current_data.empty
-            else None
-        )
 
         # We want to make sure there's production data available to run the reports.
         # If there's no production data, we'll skip the reports that need it.
         self.current_dataset = None
         if current_data is not None and not current_data.empty:
-            self.current_dataset = Dataset.from_pandas(
-                current_data, data_definition=data_definition
-            )
+            # We also need to filter out the samples that have NaNs in any of the
+            # columns we use.
+            current_data = current_data.dropna(subset=all_cols)
+
+            if not current_data.empty:
+                # Ensure categorical columns are strings
+                for col in cat_cols + ["target", "prediction"]:
+                    current_data[col] = current_data[col].astype(str)
+
+                self.current_dataset = Dataset.from_pandas(
+                    current_data, data_definition=data_definition
+                )
 
         self.next(self.data_summary_report)
 
